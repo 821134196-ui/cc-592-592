@@ -1,0 +1,735 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>散装食品称重标签错贴纠正系统</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/vendor/vue.global.prod.js"></script>
+</head>
+<body>
+<div id="app">
+  <!-- 顶栏 -->
+  <header class="topbar">
+    <div class="logo">🛒 散装食品称重标签纠错系统<span>价格 · 过敏原全程可查</span></div>
+    <nav class="tabs">
+      <button v-for="t in tabs" :key="t.key" :class="{active: tab===t.key}" @click="switchTab(t.key)">{{t.label}}</button>
+    </nav>
+    <div class="role-box">
+      <span>当前身份</span>
+      <select v-model="role">
+        <option value="cashier">收银员 cashier-01</option>
+        <option value="supervisor">主管 supervisor-01</option>
+      </select>
+    </div>
+  </header>
+
+  <main>
+    <!-- ================= 称重台 ================= -->
+    <section v-if="tab==='scale'" class="grid two">
+      <div class="card">
+        <h2>⚖️ 称重台 · 打印标签</h2>
+        <div class="row">
+          <div>
+            <label>商品</label>
+            <select v-model="scaleForm.product_id">
+              <option v-for="p in products" :key="p.id" :value="p.id">{{p.name}}（¥{{p.unit_price.toFixed(2)}}/kg）</option>
+            </select>
+          </div>
+          <div>
+            <label>批次</label>
+            <select v-model="scaleForm.batch_id">
+              <option v-for="b in batchesFor(scaleForm.product_id)" :key="b.id" :value="b.id">{{b.batch_no}}</option>
+            </select>
+          </div>
+          <div>
+            <label>净重 (kg)</label>
+            <input v-model.number="scaleForm.net_weight" type="number" step="0.001" placeholder="0.500">
+          </div>
+          <div style="flex:0">
+            <button class="btn" @click="printLabel">打印标签</button>
+          </div>
+        </div>
+        <p class="muted small" v-if="currentProduct(scaleForm.product_id)">
+          过敏原：<span v-if="currentProduct(scaleForm.product_id).allergens">
+          <span class="tag-allergen" v-for="a in currentProduct(scaleForm.product_id).allergens.split(',')" :key="a">{{a}}</span></span>
+          <span v-else>无</span> ｜ 打印时单价与过敏原将写入标签快照，之后调价不改变本标签
+        </p>
+
+        <hr class="sep">
+        <h2>🔁 付款前贴错 · 注销旧码重贴</h2>
+        <div class="row">
+          <div style="flex:2">
+            <label>旧标签条码</label>
+            <input v-model="reprintForm.old_barcode" placeholder="扫描/粘贴旧码 LB...">
+          </div>
+          <div style="flex:2">
+            <label>注销原因</label>
+            <input v-model="reprintForm.reason" placeholder="如：商品串袋贴错">
+          </div>
+          <div style="flex:0">
+            <button class="btn amber" @click="voidReprint">注销并重贴</button>
+          </div>
+        </div>
+        <p class="muted small">旧码立即作废（void），新码指向旧码留痕；已结账标签不能注销，须走结账后纠错。</p>
+      </div>
+
+      <div class="card">
+        <h2>🏷️ 最新标签</h2>
+        <div v-if="lastLabel" :class="['sticker', lastLabel.status==='void' ? 'void-sticker':'']">
+          <div class="stamp" v-if="lastLabel.status==='void'">作 废</div>
+          <div class="s-name">{{lastLabel.product_name}}</div>
+          <div class="s-price">¥{{lastLabel.total_price.toFixed(2)}}</div>
+          <div class="s-barcode"></div>
+          <div class="s-code">{{lastLabel.barcode}}</div>
+          <div class="s-meta">
+            <span>净重 {{lastLabel.net_weight.toFixed(3)}}kg</span>
+            <span>单价 ¥{{lastLabel.unit_price.toFixed(2)}}/kg</span>
+          </div>
+          <div class="s-meta"><span>批次 {{lastLabel.batch_no}}</span>
+            <span><b :class="{'badge void': lastLabel.status==='void', 'badge active': lastLabel.status==='active'}">{{statusText(lastLabel.status)}}</b></span>
+          </div>
+          <div class="s-meta" v-if="lastLabel.allergen_snapshot"><span>过敏原：{{lastLabel.allergen_snapshot}}</span></div>
+          <div class="s-meta" v-if="lastLabel.reprinted_from_barcode"><span>重贴自 {{lastLabel.reprinted_from_barcode}}</span></div>
+        </div>
+        <div v-else class="empty">尚未打印标签</div>
+
+        <h3>最近标签记录</h3>
+        <div class="table-wrap">
+          <table>
+            <tr><th>条码</th><th>商品</th><th>重量</th><th>金额</th><th>状态</th></tr>
+            <tr v-for="l in labels" :key="l.id">
+              <td style="font-family:monospace;font-size:12px">{{l.barcode.slice(-8)}}</td>
+              <td>{{l.product_name}}</td>
+              <td>{{l.net_weight.toFixed(3)}}</td>
+              <td>¥{{l.total_price.toFixed(2)}}</td>
+              <td><span :class="'badge '+l.status">{{statusText(l.status)}}</span></td>
+            </tr>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 收银台 ================= -->
+    <section v-if="tab==='cashier'" class="grid sidebar">
+      <div class="card">
+        <h2>🧾 收银台 <span class="pill-register">收银机 R1</span></h2>
+        <button class="btn ghost sm" @click="openOrder">新开交易单</button>
+        <span v-if="curOrder" class="small muted">当前单 {{curOrder.order_no}}（{{statusText(curOrder.status)}}）</span>
+        <span v-else class="small muted">未开单</span>
+
+        <h3>扫码结算</h3>
+        <div class="row">
+          <div style="flex:2">
+            <label>扫描/输入条码</label>
+            <input v-model="scanCode" placeholder="LB..." @keyup.enter="scanIntoOrder">
+          </div>
+          <div style="flex:0"><button class="btn" @click="scanIntoOrder">入单</button></div>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <div style="flex:0">
+            <button class="btn gray sm" @click="gunTrigger">📷 模拟扫码枪触发</button>
+          </div>
+          <div style="flex:0">
+            <button class="btn gray sm" @click="gunPoll">⇩ 轮询扫码枪输入</button>
+          </div>
+        </div>
+        <p class="muted small">本地硬件模拟：扫码枪把条码推入队列，收银端轮询取出后入单。</p>
+
+        <div v-if="lastBlocked" class="blocked">⛔ {{lastBlocked}}</div>
+
+        <hr class="sep">
+        <button class="btn" :disabled="!curOrder || curOrder.status!=='open' || !curOrder.items.length" @click="checkout">
+          💳 结账 ¥{{curOrder ? curOrder.total.toFixed(2) : '0.00'}}
+        </button>
+        <button class="btn ghost sm" style="margin-left:8px" :disabled="!curOrder || curOrder.status!=='paid'" @click="loadReceipt">查看回执</button>
+
+        <div v-if="receiptText" class="receipt" style="margin-top:12px">{{receiptText}}</div>
+      </div>
+
+      <div class="card">
+        <h2>🧺 当前订单商品（成交价格快照）</h2>
+        <div v-if="!curOrder || !curOrder.items.length" class="empty">扫入称重标签后显示明细</div>
+        <div class="table-wrap" v-else>
+          <table>
+            <tr><th>商品</th><th>批次</th><th>净重</th><th>成交单价</th><th>金额</th><th>过敏原</th></tr>
+            <tr v-for="it in curOrder.items" :key="it.id">
+              <td>{{it.product_name}}</td>
+              <td class="small">{{it.batch_no}}</td>
+              <td>{{it.net_weight.toFixed(3)}}kg</td>
+              <td>¥{{it.unit_price.toFixed(2)}}/kg</td>
+              <td><b>¥{{it.final_price.toFixed(2)}}</b></td>
+              <td><span class="tag-allergen" v-for="a in (it.allergens_snapshot?it.allergens_snapshot.split(','):[])" :key="a">{{a}}</span><span v-if="!it.allergens_snapshot" class="muted">无</span></td>
+            </tr>
+            <tr><td colspan="4" style="text-align:right"><b>合计</b></td><td colspan="2"><b style="color:var(--red);font-size:16px">¥{{curOrder.total.toFixed(2)}}</b></td></tr>
+          </table>
+          <p class="muted small" v-if="curOrder.status==='paid'">已于 {{fmt(curOrder.paid_at)}} 结账，成交单价永久定格，不再受调价影响。</p>
+        </div>
+
+        <h3 style="margin-top:18px">已付款订单（发起纠错入口）</h3>
+        <div class="table-wrap">
+          <table>
+            <tr><th>订单号</th><th>金额</th><th>结账时间</th><th></th></tr>
+            <tr v-for="o in paidOrders" :key="o.id">
+              <td style="font-family:monospace;font-size:12px">{{o.order_no}}</td>
+              <td>¥{{o.total.toFixed(2)}}</td>
+              <td class="small">{{fmt(o.paid_at)}}</td>
+              <td><button class="btn sm" @click="startCorrection(o)">发起纠错</button></td>
+            </tr>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 纠错审批 ================= -->
+    <section v-if="tab==='corrections'" class="grid sidebar">
+      <div class="card">
+        <h2>📝 {{role==='supervisor' ? '主管也可代发起' : '收银员发起纠错'}}（结账后）</h2>
+        <p class="muted small">已结账订单不能直接换商品：收银员只能发起申请，主管核对原标签与实物后决定补收/退款。</p>
+        <label>选择已结账订单及原标签行</label>
+        <select v-model="corrForm.order_id" @change="onCorrOrderChange">
+          <option :value="null">-- 选择订单 --</option>
+          <option v-for="o in paidOrders" :key="o.id" :value="o.id">{{o.order_no}}（¥{{o.total.toFixed(2)}}）</option>
+        </select>
+        <div style="height:8px"></div>
+        <select v-model="corrForm.old_label_id">
+          <option :value="null">-- 选择贴错的标签行 --</option>
+          <option v-for="it in corrOrderItems" :key="it.id" :value="labelIdOf(it)">
+            {{it.product_name}} {{it.net_weight.toFixed(3)}}kg 实收 ¥{{it.final_price.toFixed(2)}}
+          </option>
+        </select>
+        <div class="row" style="margin-top:10px">
+          <div>
+            <label>实物实际商品</label>
+            <select v-model="corrForm.correct_product_id">
+              <option v-for="p in products" :key="p.id" :value="p.id">{{p.name}}（¥{{p.unit_price.toFixed(2)}}/kg）</option>
+            </select>
+          </div>
+          <div>
+            <label>实物净重 (kg)</label>
+            <input v-model.number="corrForm.correct_weight" type="number" step="0.001">
+          </div>
+        </div>
+        <div style="height:8px"></div>
+        <label>纠错原因</label>
+        <textarea v-model="corrForm.reason" rows="2" placeholder="如：实物为核桃仁，误贴小馒头标签"></textarea>
+        <label style="margin-top:8px;display:flex;align-items:center;gap:6px;color:var(--ink)">
+          <input type="checkbox" style="width:auto" v-model="corrForm.allergen_concern"> 涉及过敏原风险（需同批次追溯）
+        </label>
+        <div class="row" style="margin-top:10px">
+          <div style="flex:0"><button class="btn" @click="submitCorrection">提交申请</button></div>
+          <div v-if="corrPreview" class="small" style="flex:2;align-self:center">
+            原收 <b>¥{{corrPreview.original.toFixed(2)}}</b> → 应 <b>¥{{corrPreview.correct.toFixed(2)}}</b>，
+            <span :style="{color: corrPreview.diff>0 ? 'var(--red)':'var(--blue)'}">
+              {{corrPreview.diff>0 ? '补收 ¥'+corrPreview.diff.toFixed(2) : (corrPreview.diff<0 ? '退款 ¥'+Math.abs(corrPreview.diff).toFixed(2) : '无差额')}}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>🗂️ 纠错工单（主管审批）</h2>
+        <div class="table-wrap">
+          <table>
+            <tr><th>工单号</th><th>订单</th><th>类型</th><th>原因/差额</th><th>过敏原</th><th>状态</th><th>操作</th></tr>
+            <tr v-for="c in corrections" :key="c.id">
+              <td class="small" style="font-family:monospace">{{c.req_no.slice(-8)}}</td>
+              <td class="small">{{c.order_no ? c.order_no : '（未成交）'}}</td>
+              <td><span :class="'badge '+(c.kind==='pre_payment_reprint'?'consumed':'pending')">{{c.kind==='pre_payment_reprint'?'付款前重贴':'结账后差额'}}</span></td>
+              <td style="max-width:260px">
+                <div class="small">{{c.reason}}</div>
+                <div class="small" v-if="c.diff_amount!==null">
+                  原 ¥{{c.original_amount.toFixed(2)}} → 应 ¥{{c.correct_amount.toFixed(2)}}
+                  <span :class="'badge '+c.adjust_type">{{c.adjust_type==='charge'?'补收':'退款'}} ¥{{Math.abs(c.diff_amount).toFixed(2)}}</span>
+                </div>
+                <div class="small muted" v-if="c.review_note">主管意见：{{c.review_note}}</div>
+              </td>
+              <td><span v-if="c.allergen_concern" class="tag-allergen">⚠ 过敏原</span></td>
+              <td><span :class="'badge '+c.status">{{corrStatus(c.status)}}</span>
+                <div class="small muted">{{c.requested_by}}</div></td>
+              <td>
+                <template v-if="role==='supervisor'">
+                  <button v-if="c.status==='pending'" class="btn sm green" @click="review(c,true)">批准</button>
+                  <button v-if="c.status==='pending'" class="btn sm red" style="margin-left:4px" @click="review(c,false)">驳回</button>
+                  <button v-if="c.status==='approved' && c.adjust_type!=='none'" class="btn sm amber" @click="completeCorr(c)">
+                    {{c.adjust_type==='charge'?'办理补收':'办理退款'}}
+                  </button>
+                </template>
+                <span v-else class="small muted">待主管处理</span>
+              </td>
+            </tr>
+          </table>
+        </div>
+        <p class="muted small" v-if="role!=='supervisor'">当前为收银员身份，只能发起申请；切换为主管后可审批与办理收退款。</p>
+      </div>
+    </section>
+
+    <!-- ================= 订单 / 价格查询 ================= -->
+    <section v-if="tab==='orders'" class="grid two">
+      <div class="card">
+        <h2>📚 交易记录（成交价快照）</h2>
+        <div class="row">
+          <div style="flex:0">
+            <select v-model="orderFilter" @change="loadOrders">
+              <option value="">全部</option><option value="open">未付款</option><option value="paid">已结账</option>
+            </select>
+          </div>
+          <div style="flex:0"><button class="btn sm gray" @click="loadOrders">刷新</button></div>
+        </div>
+        <div class="table-wrap" style="margin-top:8px">
+          <table>
+            <tr><th>订单号</th><th>状态</th><th>行数</th><th>成交总额</th><th>时间</th><th></th></tr>
+            <tr v-for="o in orders" :key="o.id">
+              <td style="font-family:monospace;font-size:12px">{{o.order_no}}</td>
+              <td><span :class="'badge '+o.status">{{statusText(o.status)}}</span></td>
+              <td>{{o.items.length}}</td>
+              <td><b>¥{{o.total.toFixed(2)}}</b></td>
+              <td class="small">{{fmt(o.paid_at || o.created_at)}}</td>
+              <td><button class="btn sm ghost" @click="viewOrder(o)">明细</button></td>
+            </tr>
+          </table>
+        </div>
+      </div>
+      <div class="card">
+        <h2>🔎 订单明细 · 原价核对</h2>
+        <div v-if="!viewedOrder" class="empty">选择订单查看成交单价与当前单价对比</div>
+        <template v-else>
+          <p class="small muted">订单 {{viewedOrder.order_no}} · {{statusText(viewedOrder.status)}} · 收银员 {{viewedOrder.cashier}}</p>
+          <div class="table-wrap">
+            <table>
+              <tr><th>商品</th><th>批次</th><th>成交单价</th><th>当前单价</th><th>成交金额</th><th>过敏原</th></tr>
+              <tr v-for="it in viewedOrder.items" :key="it.id">
+                <td>{{it.product_name}}</td>
+                <td class="small">{{it.batch_no}}</td>
+                <td><b>¥{{it.unit_price.toFixed(2)}}</b><div class="small muted" :style="{color: priceChanged(it)?'var(--red)':''}">
+                  {{priceChanged(it)?'已调价，订单仍按原价':'未变'}}</div></td>
+                <td>
+                  <span :class="priceChanged(it) ? 'price-strike' : ''">¥{{it.unit_price.toFixed(2)}}</span>
+                  <span v-if="priceChanged(it)" style="color:var(--red)">¥{{currentPriceOf(it.product_name)}}</span>
+                </td>
+                <td><b>¥{{it.final_price.toFixed(2)}}</b></td>
+                <td><span class="tag-allergen" v-for="a in (it.allergens_snapshot?it.allergens_snapshot.split(','):[])" :key="a">{{a}}</span><span v-if="!it.allergens_snapshot" class="muted">无</span></td>
+              </tr>
+            </table>
+          </div>
+          <h3>商品调价轨迹</h3>
+          <div class="table-wrap">
+            <table>
+              <tr><th>商品</th><th>原价</th><th>新价</th><th>原因</th><th>时间</th></tr>
+              <tr v-for="h in priceHistories" :key="h.product_name + h.changed_at">
+                <td>{{h.product_name}}</td><td>¥{{h.old_price.toFixed(2)}}</td>
+                <td>¥{{h.new_price.toFixed(2)}}</td><td class="small">{{h.reason}}</td>
+                <td class="small">{{h.changed_at.replace('T',' ')}}</td>
+              </tr>
+              <tr v-if="!priceHistories.length"><td colspan="5" class="empty">暂无调价记录</td></tr>
+            </table>
+          </div>
+        </template>
+      </div>
+    </section>
+
+    <!-- ================= 商品批次 ================= -->
+    <section v-if="tab==='catalog'" class="grid two">
+      <div class="card">
+        <h2>🥜 商品与单价</h2>
+        <div class="row">
+          <div><label>编码</label><input v-model="prodForm.sku" placeholder="SP999"></div>
+          <div><label>名称</label><input v-model="prodForm.name" placeholder="商品名"></div>
+          <div><label>单价 ¥/kg</label><input v-model.number="prodForm.unit_price" type="number" step="0.01"></div>
+          <div><label>过敏原(逗号分隔)</label><input v-model="prodForm.allergens" placeholder="花生,大豆"></div>
+          <div style="flex:0"><button class="btn" @click="createProduct">新增</button></div>
+        </div>
+        <div class="table-wrap" style="margin-top:10px">
+          <table>
+            <tr><th>编码</th><th>名称</th><th>当前单价</th><th>过敏原</th><th v-if="role==='supervisor'">调价</th></tr>
+            <tr v-for="p in products" :key="p.id">
+              <td>{{p.sku}}</td><td>{{p.name}}</td><td><b>¥{{p.unit_price.toFixed(2)}}</b></td>
+              <td><span class="tag-allergen" v-for="a in (p.allergens?p.allergens.split(','):[])" :key="a">{{a}}</span><span v-if="!p.allergens" class="muted">无</span></td>
+              <td v-if="role==='supervisor'">
+                <span class="row" style="gap:4px">
+                  <input v-model.number="p._newPrice" type="number" step="0.01" style="width:80px" :placeholder="p.unit_price.toFixed(2)">
+                  <input v-model="p._reason" placeholder="调价原因" style="width:110px">
+                  <button class="btn sm" @click="changePrice(p)">调价</button>
+                </span>
+              </td>
+            </tr>
+          </table>
+        </div>
+        <p class="muted small" v-if="role!=='supervisor'">调价需主管身份；调价只影响新标签，历史标签与订单保留原价。</p>
+      </div>
+      <div class="card">
+        <h2>📦 批次管理</h2>
+        <div class="row">
+          <div><label>批次号</label><input v-model="batchForm.batch_no" placeholder="B20261004-09"></div>
+          <div><label>所属商品</label>
+            <select v-model="batchForm.product_id">
+              <option v-for="p in products" :key="p.id" :value="p.id">{{p.name}}</option>
+            </select>
+          </div>
+          <div><label>备注</label><input v-model="batchForm.note"></div>
+          <div style="flex:0"><button class="btn" @click="createBatch">新增批次</button></div>
+        </div>
+        <div class="table-wrap" style="margin-top:10px">
+          <table>
+            <tr><th>批次号</th><th>商品</th><th>备注</th></tr>
+            <tr v-for="b in batches" :key="b.id">
+              <td style="font-family:monospace">{{b.batch_no}}</td><td>{{b.product_name}}</td><td class="small muted">{{b.note}}</td>
+            </tr>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 过敏原追溯 / 台账 ================= -->
+    <section v-if="tab==='trace'" class="grid two">
+      <div class="card">
+        <h2>🔬 同批次 / 过敏原追溯</h2>
+        <div class="row">
+          <div style="flex:2"><label>按批次号查同批次已售订单</label>
+            <input v-model="traceBatch" placeholder="B20261001-01"></div>
+          <div style="flex:0"><button class="btn" @click="doTraceBatch">查批次</button></div>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <div style="flex:2"><label>按过敏原关键词查已售订单</label>
+            <input v-model="traceAllergen" placeholder="花生"></div>
+          <div style="flex:0"><button class="btn" @click="doTraceAllergen">查过敏原</button></div>
+        </div>
+        <div class="table-wrap" style="margin-top:12px">
+          <table>
+            <tr><th>订单号</th><th>商品</th><th>批次</th><th>过敏原</th><th>金额</th><th>成交时间</th></tr>
+            <tr v-for="r in traceRows" :key="r.order_no+r.product_name">
+              <td style="font-family:monospace;font-size:12px">{{r.order_no}}</td>
+              <td>{{r.product_name}}</td><td class="small">{{r.batch_no}}</td>
+              <td><span class="tag-allergen">{{r.allergens_snapshot}}</span></td>
+              <td>¥{{r.final_price.toFixed(2)}}</td>
+              <td class="small">{{fmt(r.paid_at)}}</td>
+            </tr>
+            <tr v-if="traceQueried && !traceRows.length"><td colspan="6" class="empty">无命中订单</td></tr>
+          </table>
+        </div>
+      </div>
+      <div class="card">
+        <h2>💰 差额收退款台账</h2>
+        <p class="muted small">每笔补收/退款均与原交易订单、原金额挂钩，可逐笔核对。</p>
+        <div class="table-wrap">
+          <table>
+            <tr><th>时间</th><th>原订单</th><th>类型</th><th>原金额</th><th>差额</th><th>办理人</th><th>说明</th></tr>
+            <tr v-for="a in adjustments" :key="a.id">
+              <td class="small">{{a.handled_at.replace('T',' ')}}</td>
+              <td style="font-family:monospace;font-size:12px">{{a.order_no}}</td>
+              <td><span :class="'badge '+a.direction">{{a.direction==='charge'?'补收':'退款'}}</span></td>
+              <td>¥{{a.original_amount.toFixed(2)}}</td>
+              <td><b>¥{{a.amount.toFixed(2)}}</b></td>
+              <td class="small">{{a.handled_by}}</td>
+              <td class="small muted">{{a.note}}</td>
+            </tr>
+            <tr v-if="!adjustments.length"><td colspan="7" class="empty">暂无收退款记录</td></tr>
+          </table>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div class="toast-wrap">
+    <div v-for="t in toasts" :key="t.id" :class="'toast '+t.type">{{t.msg}}</div>
+  </div>
+</div>
+
+<script>
+const { createApp } = Vue;
+
+createApp({
+  data() {
+    return {
+      tab: 'scale',
+      tabs: [
+        { key: 'scale', label: '⚖️ 称重台' },
+        { key: 'cashier', label: '🧾 收银台' },
+        { key: 'corrections', label: '📝 纠错审批' },
+        { key: 'orders', label: '📚 订单原价' },
+        { key: 'catalog', label: '🥜 商品批次' },
+        { key: 'trace', label: '🔬 追溯台账' },
+      ],
+      role: 'cashier',
+      products: [], batches: [], labels: [],
+      lastLabel: null,
+      scaleForm: { product_id: null, batch_id: null, net_weight: 0.5 },
+      reprintForm: { old_barcode: '', reason: '付款前发现标签贴错，重新称重' },
+      curOrder: null, scanCode: '', lastBlocked: '', receiptText: '',
+      orders: [], orderFilter: '', paidOrders: [], viewedOrder: null, priceHistories: [],
+      corrections: [],
+      corrForm: { order_id: null, old_label_id: null, correct_product_id: null,
+                  correct_weight: 0.5, reason: '', allergen_concern: false },
+      traceBatch: 'B20261001-01', traceAllergen: '花生', traceRows: [], traceQueried: false,
+      adjustments: [],
+      prodForm: { sku: '', name: '', unit_price: null, allergens: '' },
+      batchForm: { batch_no: '', product_id: null, note: '' },
+      toasts: [], toastSeq: 1,
+    };
+  },
+  computed: {
+    corrOrderItems() {
+      const o = this.paidOrders.find(x => x.id === this.corrForm.order_id);
+      return o ? o.items : [];
+    },
+    corrPreview() {
+      const it = this.corrOrderItems.find(i => i.id === this.corrForm.old_label_id || this.labelIdOf(i) === this.corrForm.old_label_id);
+      const p = this.products.find(x => x.id === this.corrForm.correct_product_id);
+      if (!it || !p || !(this.corrForm.correct_weight > 0)) return null;
+      const original = it.final_price;
+      const correct = Math.round(this.corrForm.correct_weight * p.unit_price * 100) / 100;
+      return { original, correct, diff: Math.round((correct - original) * 100) / 100 };
+    },
+  },
+  async mounted() {
+    await this.refreshAll();
+    setInterval(() => { if (['cashier', 'corrections'].includes(this.tab)) this.silentRefresh(); }, 5000);
+  },
+  methods: {
+    fmt(t) { return t ? t.replace('T', ' ').slice(0, 19) : ''; },
+    statusText(s) {
+      return { active: '有效', void: '已作废', consumed: '已结账', disputed: '争议中',
+               open: '未付款', paid: '已结账', refunded: '已退款' }[s] || s;
+    },
+    corrStatus(s) {
+      return { pending: '待主管审批', approved: '已批准待收退款', rejected: '已驳回', done: '已完成' }[s] || s;
+    },
+    labelIdOf(it) { return it.label_id || null; },
+    currentProduct(id) { return this.products.find(p => p.id === id); },
+    currentPriceOf(name) { const p = this.products.find(x => x.name === name); return p ? p.unit_price.toFixed(2) : '?'; },
+    priceChanged(it) {
+      const p = this.products.find(x => x.name === it.product_name);
+      return p && Math.abs(p.unit_price - it.unit_price) > 0.001;
+    },
+    batchesFor(pid) { return this.batches.filter(b => b.product_id === pid); },
+
+    toast(msg, type = 'ok') {
+      const id = this.toastSeq++;
+      this.toasts.push({ id, msg, type });
+      setTimeout(() => { this.toasts = this.toasts.filter(t => t.id !== id); }, 5000);
+    },
+    async api(method, url, body) {
+      const opt = { method, headers: { 'Content-Type': 'application/json', 'X-Role': this.role } };
+      if (body !== undefined) opt.body = JSON.stringify(body);
+      const res = await fetch(url, opt);
+      let data = null;
+      try { data = await res.json(); } catch (e) { data = { detail: '非 JSON 响应' }; }
+      if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : ('请求失败 ' + res.status));
+      return data;
+    },
+
+    async refreshAll() {
+      await Promise.all([this.loadProducts(), this.loadBatches(), this.loadLabels(),
+                         this.loadOrders(), this.loadCorrections(), this.loadAdjustments()]);
+      if (!this.scaleForm.product_id && this.products[0]) {
+        this.scaleForm.product_id = this.products[0].id;
+        const bs = this.batchesFor(this.scaleForm.product_id);
+        this.scaleForm.batch_id = bs[0] && bs[0].id;
+      }
+      if (!this.corrForm.correct_product_id && this.products[0])
+        this.corrForm.correct_product_id = this.products[0].id;
+    },
+    async silentRefresh() {
+      try {
+        const [os, cs] = await Promise.all([
+          this.api('GET', '/api/orders'),
+          this.api('GET', '/api/corrections'),
+        ]);
+        this.orders = os;
+        this.paidOrders = os.filter(o => o.status === 'paid');
+        this.corrections = cs;
+        if (this.curOrder) {
+          const fresh = os.find(o => o.id === this.curOrder.id);
+          if (fresh) this.curOrder = fresh;
+        }
+        await this.loadAdjustments();
+      } catch (e) { /* 后台轮询静默 */ }
+    },
+    async loadProducts() {
+      this.products = (await this.api('GET', '/api/products')).map(p => ({ ...p, _newPrice: null, _reason: '' }));
+    },
+    async loadBatches() { this.batches = await this.api('GET', '/api/batches'); },
+    async loadLabels() {
+      this.labels = await this.api('GET', '/api/labels?limit=30');
+    },
+    async loadOrders() {
+      this.orders = await this.api('GET', '/api/orders' + (this.orderFilter ? '?status=' + this.orderFilter : ''));
+      const all = await this.api('GET', '/api/orders');
+      this.paidOrders = all.filter(o => o.status === 'paid');
+    },
+    async loadCorrections() { this.corrections = await this.api('GET', '/api/corrections'); },
+    async loadAdjustments() { this.adjustments = await this.api('GET', '/api/adjustments'); },
+
+    switchTab(t) {
+      this.tab = t;
+      if (t === 'orders') this.loadOrders();
+      if (t === 'trace') this.loadAdjustments();
+      if (t === 'corrections') { this.loadOrders(); this.loadCorrections(); }
+    },
+
+    // 称重台
+    async printLabel() {
+      try {
+        const l = await this.api('POST', '/api/labels', {
+          product_id: this.scaleForm.product_id, batch_id: this.scaleForm.batch_id,
+          net_weight: this.scaleForm.net_weight,
+        });
+        this.lastLabel = l;
+        this.toast(`已打印标签：${l.product_name} ¥${l.total_price.toFixed(2)}，条码 ${l.barcode}`);
+        this.reprintForm.old_barcode = l.barcode;
+        await this.loadLabels();
+      } catch (e) { this.toast(e.message, 'err'); }
+    },
+    async voidReprint() {
+      try {
+        const c = await this.api('POST', '/api/labels/void-and-reprint', {
+          old_barcode: this.reprintForm.old_barcode.trim(), reason: this.reprintForm.reason });
+        this.toast(`旧码 ${c.old_barcode} 已注销，新码 ${c.new_barcode} 已打印。旧码再扫将被拦截。`);
+        const newL = this.labels.find(l => l.barcode === c.new_barcode);
+        if (newL) this.lastLabel = newL;
+        this.reprintForm.old_barcode = c.new_barcode;
+        await this.loadLabels();
+        this.lastLabel = this.labels.find(l => l.barcode === c.new_barcode) || this.lastLabel;
+      } catch (e) { this.toast(e.message, 'err'); }
+    },
+
+    // 收银
+    async openOrder() {
+      this.curOrder = await this.api('POST', '/api/orders', { cashier: 'cashier-01', register_no: 'R1' });
+      this.lastBlocked = ''; this.receiptText = '';
+      this.toast(`已开单 ${this.curOrder.order_no}`);
+      this.loadOrders();
+    },
+    async gunTrigger() {
+      const code = (this.scanCode || '').trim();
+      if (!code) return this.toast('请先在扫码框填入条码，再模拟扫码枪触发', 'info');
+      await this.api('POST', '/api/scan/trigger?register_no=R1', { barcode: code });
+      this.toast(`📷 扫码枪已读入 ${code}，等待收银端轮询`, 'info');
+    },
+    async gunPoll() {
+      const r = await this.api('GET', '/api/scan/poll?register_no=R1');
+      if (!r.barcode) return this.toast('扫码枪队列为空', 'info');
+      this.scanCode = r.barcode;
+      await this.scanIntoOrder();
+    },
+    async scanIntoOrder() {
+      if (!this.curOrder || this.curOrder.status !== 'open') {
+        if (!this.curOrder) return this.toast('请先新开交易单', 'err');
+      }
+      if (!this.curOrder) return;
+      const code = (this.scanCode || '').trim();
+      if (!code) return;
+      try {
+        this.curOrder = await this.api('POST', `/api/orders/${this.curOrder.id}/scan`, { barcode: code });
+        this.lastBlocked = '';
+        this.toast(`入单成功：当前合计 ¥${this.curOrder.total.toFixed(2)}`);
+        this.scanCode = '';
+      } catch (e) {
+        this.lastBlocked = e.message;
+        this.toast(e.message, 'err');
+      }
+    },
+    async checkout() {
+      try {
+        this.curOrder = await this.api('POST', `/api/orders/${this.curOrder.id}/checkout`);
+        this.toast(`结账成功 ¥${this.curOrder.total.toFixed(2)}，回执已本地打印`);
+        await this.loadReceipt();
+        await this.loadOrders();
+        await this.loadLabels();
+      } catch (e) { this.toast(e.message, 'err'); }
+    },
+    async loadReceipt() {
+      if (!this.curOrder) return;
+      const res = await fetch(`/api/orders/${this.curOrder.id}/receipt`, { headers: { 'X-Role': this.role } });
+      this.receiptText = res.ok ? await res.text() : '';
+    },
+
+    // 纠错
+    onCorrOrderChange() { this.corrForm.old_label_id = null; },
+    startCorrection(o) {
+      this.tab = 'corrections';
+      this.$nextTick(() => { this.corrForm.order_id = o.id; });
+    },
+    async submitCorrection() {
+      try {
+        const c = await this.api('POST', '/api/corrections', {
+          order_id: this.corrForm.order_id, old_label_id: this.corrForm.old_label_id,
+          correct_product_id: this.corrForm.correct_product_id,
+          correct_weight: this.corrForm.correct_weight, reason: this.corrForm.reason,
+          allergen_concern: this.corrForm.allergen_concern,
+          requested_by: 'cashier-01',
+        });
+        this.toast(`申请 ${c.req_no} 已提交，等待主管核对审批（差额 ¥${Math.abs(c.diff_amount).toFixed(2)} ${c.adjust_type==='charge'?'补收':'退款'}）`);
+        this.corrForm.reason = '';
+        await this.loadCorrections();
+      } catch (e) { this.toast(e.message, 'err'); }
+    },
+    async review(c, approve) {
+      const note = approve ? '主管核对原标签与实物无误，同意办理' : '主管核对后驳回';
+      try {
+        await this.api('POST', `/api/corrections/${c.id}/review`,
+          { approve, review_note: note, reviewer: 'supervisor-01' });
+        this.toast(approve ? '已批准，可办理收退款' : '已驳回');
+        await this.loadCorrections();
+      } catch (e) { this.toast(e.message, 'err'); }
+    },
+    async completeCorr(c) {
+      try {
+        const r = await this.api('POST', `/api/corrections/${c.id}/complete`, { reviewer: 'supervisor-01' });
+        this.toast(`${c.adjust_type==='charge'?'补收':'退款'} ¥${Math.abs(r.diff_amount).toFixed(2)} 已办理（与原交易核对一致），原订单金额保留`);
+        await this.loadCorrections(); await this.loadAdjustments();
+      } catch (e) { this.toast(e.message, 'err'); }
+    },
+
+    // 订单查询
+    async viewOrder(o) {
+      this.viewedOrder = await this.api('GET', `/api/orders/${o.id}`);
+      const pids = [...new Set(this.viewedOrder.items.map(it =>
+        (this.products.find(p => p.name === it.product_name) || {}).id).filter(Boolean))];
+      const hs = await Promise.all(pids.map(pid => this.api('GET', `/api/products/${pid}/price-history`)));
+      this.priceHistories = hs.flatMap(h => (h.history || []).map(x => ({ ...x, product_name: h.product.name })));
+    },
+
+    // 商品批次
+    async createProduct() {
+      try {
+        await this.api('POST', '/api/products', this.prodForm);
+        this.toast('商品已新增');
+        this.prodForm = { sku: '', name: '', unit_price: null, allergens: '' };
+        await this.loadProducts();
+      } catch (e) { this.toast(e.message, 'err'); }
+    },
+    async changePrice(p) {
+      if (!(p._newPrice >= 0)) return this.toast('请输入新单价', 'err');
+      try {
+        await this.api('PUT', `/api/products/${p.id}/price`, { unit_price: p._newPrice, reason: p._reason || '主管调价' });
+        this.toast(`${p.name} 调价 ¥${p.unit_price.toFixed(2)} → ¥${p._newPrice.toFixed(2)}，历史标签与订单原价不变`);
+        await this.loadProducts();
+      } catch (e) { this.toast(e.message, 'err'); }
+    },
+    async createBatch() {
+      try {
+        await this.api('POST', '/api/batches', this.batchForm);
+        this.toast('批次已新增');
+        this.batchForm = { batch_no: '', product_id: this.batchForm.product_id, note: '' };
+        await this.loadBatches();
+      } catch (e) { this.toast(e.message, 'err'); }
+    },
+
+    // 追溯
+    async doTraceBatch() {
+      try {
+        this.traceRows = await this.api('GET', '/api/trace/batch/' + encodeURIComponent(this.traceBatch.trim()));
+        this.traceQueried = true;
+        this.toast(`批次 ${this.traceBatch} 命中 ${this.traceRows.length} 笔已售订单`, 'info');
+      } catch (e) { this.toast(e.message, 'err'); }
+    },
+    async doTraceAllergen() {
+      this.traceRows = await this.api('GET', '/api/trace/allergen/' + encodeURIComponent(this.traceAllergen.trim()));
+      this.traceQueried = true;
+    },
+  },
+}).mount('#app');
+</script>
+</body>
+</html>
