@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>散装食品称重标签错贴纠正系统</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div id="app">
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">⚖</span>
+      <div>
+        <h1>散装食品称重标签错贴纠正系统</h1>
+        <small>唯一条码 · 价格快照 · 作废拦截 · 主管纠错 · 过敏原批次追溯</small>
+      </div>
+    </div>
+    <div class="userbox">
+      <label>当前操作人员</label>
+      <select v-model="userId" @change="onUserChange">
+        <option v-for="u in users" :key="u.id" :value="u.id">
+          {{u.display_name}}（{{u.role==='supervisor'?'主管':'收银员'}}）
+        </option>
+      </select>
+      <span class="role-badge" :class="user&&user.role">{{user && (user.role==='supervisor'?'主管':'收银员')}}</span>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <button v-for="t in tabs" :key="t.k" :class="{active:tab===t.k}" @click="tab=t.k">{{t.label}}</button>
+  </nav>
+
+  <!-- 全局提示 -->
+  <div class="toast-wrap">
+    <transition-group name="toast">
+      <div v-for="t in toasts" :key="t.id" class="toast" :class="t.type">{{t.msg}}</div>
+    </transition-group>
+  </div>
+
+  <!-- ══════════ 称重台 ══════════ -->
+  <section v-if="tab==='weigh'" class="page">
+    <div class="grid-2">
+      <div class="card">
+        <h2>称重 / 打印标签</h2>
+        <div class="form-row">
+          <label>商品</label>
+          <select v-model="weigh.product_id" @change="loadBatches">
+            <option :value="null">请选择商品</option>
+            <option v-for="p in products" :key="p.id" :value="p.id">
+              {{p.name}}（{{p.unit_price.toFixed(2)}} 元/{{p.unit}}）
+            </option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label>批次</label>
+          <select v-model="weigh.batch_id" :disabled="!weigh.product_id">
+            <option :value="null">请选择批次</option>
+            <option v-for="b in batchesOfProduct" :key="b.id" :value="b.id">{{b.batch_no}}</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label>净重 (kg)</label>
+          <input type="number" step="0.001" min="0.001" v-model="weigh.net_weight" placeholder="例如 0.750">
+        </div>
+        <div class="form-row" v-if="weigh.reprint_of_barcode">
+          <label>补打注销</label>
+          <div class="inline">
+            <span class="warn-chip">将注销旧码 {{weigh.reprint_of_barcode}}，旧码扫码将被拦截</span>
+            <button class="btn-link" @click="weigh.reprint_of_barcode=null">取消补打</button>
+          </div>
+        </div>
+        <button class="btn primary" :disabled="!canWeigh" @click="doWeigh(false)">
+          {{weigh.reprint_of_barcode ? '重新称重并补打（注销旧码）' : '称重并打印标签'}}
+        </button>
+      </div>
+
+      <div class="card">
+        <h2>标签打印机（本地模拟）</h2>
+        <pre class="paper" v-if="lastLabelPaper">{{lastLabelPaper}}</pre>
+        <p v-else class="muted">称重后在此输出实体标签样张，含唯一条码、净重、批次、价格与过敏原。</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>最近标签</h2>
+        <button class="btn ghost" @click="loadLabels">刷新</button>
+      </div>
+      <table class="tbl">
+        <thead><tr><th>条码</th><th>商品</th><th>批次</th><th>净重kg</th><th>单价</th><th>金额</th><th>过敏原</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody>
+          <tr v-for="l in labels" :key="l.id" :class="{'row-void':l.status==='voided','row-used':l.status==='consumed'}">
+            <td class="mono">{{l.barcode}}</td>
+            <td>{{l.product_name}}</td>
+            <td class="mono">{{l.batch_no}}</td>
+            <td>{{l.net_weight.toFixed(3)}}</td>
+            <td>{{l.unit_price.toFixed(2)}}</td>
+            <td>{{l.amount.toFixed(2)}}</td>
+            <td>{{l.allergens.join('、') || '无'}}</td>
+            <td><span class="status" :class="l.status">{{statusText(l.status)}}</span>
+              <div v-if="l.status==='voided'" class="sub">已由 {{l.reprint_of_barcode ? '补打' : '注销'}} 替换</div>
+            </td>
+            <td>
+              <button v-if="l.status==='active'" class="btn-sm" @click="setReprint(l)">重新称重补打</button>
+              <button v-if="l.status==='active'" class="btn-sm danger" @click="doVoid(l)">注销</button>
+              <span v-else class="muted">—</span>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ══════════ 收银台 ══════════ -->
+  <section v-if="tab==='pos'" class="page">
+    <div class="grid-2">
+      <div class="card">
+        <h2>扫码收银 <span v-if="currentTxn" class="muted">订单 {{currentTxn.txn_no}}（{{currentTxn.status==='paid'?'已结账':'进行中'}}）</span></h2>
+        <div class="scan-row">
+          <input v-model="scanCode" placeholder="扫描或输入称重标签条码" @keyup.enter="doScan"
+                 :disabled="!!currentTxn && currentTxn.status==='paid'">
+          <button class="btn primary" @click="doScan"
+                  :disabled="!!currentTxn && currentTxn.status==='paid'">扫码入账</button>
+        </div>
+        <p class="muted tiny">扫到 <b>作废码 / 重复码 / 不存在码</b> 时系统强制拦截，该商品不得入账。</p>
+
+        <table class="tbl" v-if="currentTxn && currentTxn.items.length">
+          <thead><tr><th>商品</th><th>批次</th><th>净重kg</th><th>成交单价</th><th>金额</th><th>过敏原</th><th></th></tr></thead>
+          <tbody>
+            <tr v-for="it in currentTxn.items" :key="it.id">
+              <td>{{it.product_name}}<div class="sub mono">{{it.label_barcode}}</div></td>
+              <td class="mono">{{it.batch_no}}</td>
+              <td>{{it.net_weight.toFixed(3)}}</td>
+              <td class="strong">{{it.unit_price.toFixed(2)}}</td>
+              <td class="strong">{{it.amount.toFixed(2)}}</td>
+              <td>{{it.allergens.join('、')||'无'}}</td>
+              <td><button v-if="currentTxn.status==='open'" class="btn-sm danger" @click="doRemove(it)">移除</button></td>
+            </tr>
+          </tbody>
+        </table>
+        <p v-else class="muted">暂无商品，请扫码。</p>
+
+        <div class="pay-bar" v-if="currentTxn">
+          <div class="total">合计：<b>{{currentTxn.total_amount.toFixed(2)}}</b> 元
+            <span class="muted" v-if="currentTxn.status==='paid'">（成交价已冻结）</span>
+          </div>
+          <button v-if="currentTxn.status==='open'" class="btn primary big"
+                  :disabled="!currentTxn.items.length" @click="doPay">结账收款</button>
+          <button v-else class="btn" @click="showReceipt(currentTxn.txn_no)">补打收银小票</button>
+          <button class="btn ghost" @click="currentTxn=null; scanCode=''">开始新单</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>收银小票（本地模拟）</h2>
+        <pre class="paper" v-if="receiptText">{{receiptText}}</pre>
+        <p v-else class="muted">结账或补打后在此显示小票，金额固定为成交快照。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══════════ 订单 / 追溯 ══════════ -->
+  <section v-if="tab==='orders'" class="page">
+    <div class="card">
+      <div class="card-head">
+        <h2>订单查询（成交价留痕，调价不影响原单）</h2>
+        <div class="inline">
+          <input v-model="txnQuery" placeholder="输入订单号精确查询" class="w200">
+          <button class="btn" @click="queryTxn">查询</button>
+          <button class="btn ghost" @click="loadTxns">全部订单</button>
+        </div>
+      </div>
+      <table class="tbl">
+        <thead><tr><th>订单号</th><th>状态</th><th>收银员</th><th>结账时间</th><th>成交总额</th><th>操作</th></tr></thead>
+        <tbody>
+          <tr v-for="t in txns" :key="t.txn_no" :class="{sel: t.txn_no===selectedTxnNo}">
+            <td class="mono">{{t.txn_no}}</td>
+            <td><span class="status" :class="t.status">{{t.status==='paid'?'已结账':'进行中'}}</span></td>
+            <td>{{t.cashier_name}}</td>
+            <td>{{fmt(t.paid_at)||'—'}}</td>
+            <td class="strong">{{t.total_amount.toFixed(2)}}</td>
+            <td>
+              <button class="btn-sm" @click="selectTxn(t.txn_no)">明细</button>
+              <button class="btn-sm" v-if="t.status==='paid'" @click="showReceipt(t.txn_no)">小票</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card" v-if="selectedTxn">
+      <div class="card-head"><h2>订单明细 {{selectedTxn.txn_no}}</h2>
+        <button class="btn ghost" @click="selectedTxnNo=null">关闭</button></div>
+      <table class="tbl">
+        <thead><tr><th>条码</th><th>商品</th><th>批次</th><th>净重kg</th><th>成交单价</th><th>现价(参考)</th><th>成交金额</th><th>过敏原</th>
+          <th v-if="selectedTxn.status==='paid'">纠错</th></tr></thead>
+        <tbody>
+          <tr v-for="it in selectedTxn.items" :key="it.id">
+            <td class="mono">{{it.label_barcode}}</td>
+            <td>{{it.product_name}}</td>
+            <td class="mono">{{it.batch_no}}</td>
+            <td>{{it.net_weight.toFixed(3)}}</td>
+            <td class="strong price-lock">{{it.unit_price.toFixed(2)}}</td>
+            <td :class="{'price-up':it.current_unit_price!==it.unit_price}">
+              {{it.current_unit_price!==null ? it.current_unit_price.toFixed(2) : '—'}}
+            </td>
+            <td class="strong">{{it.amount.toFixed(2)}}</td>
+            <td>{{it.allergens.join('、')||'无'}}</td>
+            <td v-if="selectedTxn.status==='paid'">
+              <button class="btn-sm warn" @click="openCorrection(it)">发起纠错申请</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <p class="muted tiny">已结账订单不可直接换货；如实物与标签不符，由收银员发起申请、主管核对后按差额补收/退款。</p>
+    </div>
+
+    <div class="card">
+      <h2>过敏原 / 批次追溯</h2>
+      <div class="inline wrap">
+        <select v-model="trace.batch_no" class="w260">
+          <option value="">选择批次</option>
+          <option v-for="b in allBatches" :key="b.id" :value="b.batch_no">{{b.batch_no}} · {{b.product_name}}</option>
+        </select>
+        <input v-model="trace.allergen" placeholder="过敏原过滤，如：花生" class="w160">
+        <button class="btn primary" :disabled="!trace.batch_no" @click="doTrace">追溯同批次订单</button>
+      </div>
+      <div v-if="traceResult">
+        <h3>批次 {{traceResult.batch_no}}（{{traceResult.product_name}}）
+          <span v-if="traceResult.allergen_filter" class="warn-chip">仅看含「{{traceResult.allergen_filter}}」</span>
+        </h3>
+        <table class="tbl">
+          <thead><tr><th>订单号</th><th>状态</th><th>结账时间</th><th>条码</th><th>净重kg</th><th>金额</th><th>过敏原</th></tr></thead>
+          <tbody>
+            <tr v-for="o in traceResult.affected_orders" :key="o.txn_no+o.barcode">
+              <td class="mono">{{o.txn_no}}</td><td>{{o.status==='paid'?'已结账':'进行中'}}</td>
+              <td>{{fmt(o.paid_at)||'—'}}</td><td class="mono">{{o.barcode}}</td>
+              <td>{{o.net_weight.toFixed(3)}}</td><td>{{o.amount.toFixed(2)}}</td>
+              <td>{{o.allergens.join('、')}}</td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="muted">未售出 / 已注销标签 {{traceResult.unsold_or_voided_labels.length}} 张
+          <span v-for="u in traceResult.unsold_or_voided_labels" :key="u.barcode">
+            ｜<span class="mono">{{u.barcode}}</span>({{statusText(u.status)}})
+          </span>
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══════════ 商品调价 ══════════ -->
+  <section v-if="tab==='price'" class="page">
+    <div class="grid-2">
+      <div class="card" v-for="p in products" :key="p.id">
+        <h2>{{p.name}} <span class="muted tiny">{{p.sku}}</span></h2>
+        <p>过敏原：{{p.allergens.length ? p.allergens.map(a=>a.name).join('、') : '无'}}</p>
+        <p>当前单价：<b class="big-price">{{p.unit_price.toFixed(2)}}</b> 元/{{p.unit}}</p>
+        <div class="inline">
+          <input type="number" step="0.01" min="0" v-model.number="priceDraft[p.id]" placeholder="新单价">
+          <button class="btn primary" @click="doPriceChange(p)">调价</button>
+          <button class="btn ghost" @click="loadHistory(p)">调价记录</button>
+        </div>
+        <ul class="history" v-if="historyMap[p.id]">
+          <li v-for="(h,i) in historyMap[p.id]" :key="i">
+            {{fmt(h.changed_at)}}：{{h.old_price.toFixed(2)}} → <b>{{h.new_price.toFixed(2)}}</b>
+          </li>
+          <li v-if="!historyMap[p.id].length" class="muted">暂无调价记录，新标签按建档价。</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══════════ 纠错审批 ══════════ -->
+  <section v-if="tab==='correction'" class="page">
+    <div class="card">
+      <div class="card-head">
+        <h2>纠错单</h2>
+        <div class="inline">
+          <button class="btn ghost" :class="{on:corrFilter==='pending'}" @click="corrFilter='pending'">待审批</button>
+          <button class="btn ghost" :class="{on:corrFilter==='approved'}" @click="corrFilter='approved'">已核准</button>
+          <button class="btn ghost" :class="{on:corrFilter==='rejected'}" @click="corrFilter='rejected'">已驳回</button>
+          <button class="btn ghost" :class="{on:!corrFilter}" @click="corrFilter=''">全部</button>
+          <button class="btn" @click="loadCorrections">刷新</button>
+        </div>
+      </div>
+      <p class="muted tiny" v-if="!isSupervisor">普通收银员只能发起申请（入口在「订单查询 → 已结账订单明细」），审批按钮仅主管可见。</p>
+
+      <table class="tbl">
+        <thead><tr><th>纠错单号</th><th>原订单</th><th>标签商品</th><th>原金额</th><th>原因</th><th>申请人</th><th>状态</th>
+          <th>主管处理结果</th><th v-if="isSupervisor">审批</th></tr></thead>
+        <tbody>
+          <tr v-for="c in corrections" :key="c.correction_no">
+            <td class="mono">{{c.correction_no}}</td>
+            <td class="mono">{{c.txn_no}}</td>
+            <td>{{c.product_name}}<div class="sub mono">{{c.label_barcode}} / {{c.batch_no}}</div></td>
+            <td class="strong">{{c.original_amount.toFixed(2)}}</td>
+            <td class="reason">{{c.reason}}</td>
+            <td>{{c.requested_by_name}}</td>
+            <td><span class="status" :class="corrStatusClass(c.status)">{{corrStatusText(c.status)}}</span></td>
+            <td>
+              <template v-if="c.status==='approved'">
+                实物：{{c.correct_product_name}} {{c.correct_weight}}kg<br>
+                应收 {{c.correct_amount.toFixed(2)}} →
+                <b :class="c.diff_amount>0?'price-up':'price-down'">
+                  {{c.decision==='charge'?'补收':c.decision==='refund'?'退款':'无差额'}}
+                  {{Math.abs(c.diff_amount).toFixed(2)}}
+                </b><br>
+                <span class="sub">{{c.reviewed_by_name}} {{fmt(c.reviewed_at)}}</span>
+                <div class="sub" v-if="c.supervisor_note">备注：{{c.supervisor_note}}</div>
+              </template>
+              <span v-else-if="c.status==='rejected'" class="sub">驳回：{{c.supervisor_note}}</span>
+              <span v-else class="muted">待主管核对原标签与实物</span>
+            </td>
+            <td v-if="isSupervisor">
+              <button v-if="c.status==='pending'" class="btn-sm warn" @click="openReview(c)">核对审批</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- 主管核对弹窗 -->
+    <div class="modal-mask" v-if="reviewing" @click.self="reviewing=null">
+      <div class="modal">
+        <h2>主管核对：{{reviewing.correction_no}}</h2>
+        <p class="muted">原订单 {{reviewing.txn_no}}｜标签 {{reviewing.product_name}}｜
+          批次 {{reviewing.batch_no}}｜原收 <b>{{reviewing.original_amount.toFixed(2)}}</b> 元</p>
+        <p class="reason">收银员申请原因：{{reviewing.reason}}</p>
+        <div class="form-row">
+          <label>核对实物商品</label>
+          <select v-model="review.correct_product_id">
+            <option :value="null">选择实物商品</option>
+            <option v-for="p in products" :key="p.id" :value="p.id">{{p.name}}</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label>实物净重 (kg)</label>
+          <input type="number" step="0.001" min="0.001" v-model.number="review.correct_weight">
+        </div>
+        <button class="btn" @click="doPreview">与原交易核对试算</button>
+
+        <div class="preview" v-if="preview">
+          <div>原成交单价：{{preview.original_unit_price.toFixed(2)}}（{{preview.original_product}}
+            {{preview.original_weight}}kg）</div>
+          <div>实物按<b>原成交时点</b>单价：{{preview.unit_price_at_txn_time.toFixed(2)}}
+            <span class="sub" v-if="preview.current_unit_price!==preview.unit_price_at_txn_time">
+              （现价 {{preview.current_unit_price.toFixed(2)}}，事后调价不参与核算）</span>
+          </div>
+          <div class="big-price">实物应收 {{preview.correct_amount.toFixed(2)}} 元，
+            差额 <b :class="preview.diff_amount>0?'price-up':preview.diff_amount<0?'price-down':''">
+              {{preview.diff_amount>=0?'+':''}}{{preview.diff_amount.toFixed(2)}}</b>
+            （{{preview.suggested_decision==='charge'?'应补收':preview.suggested_decision==='refund'?'应退款':'无差额'}}）
+          </div>
+          <div class="inline">
+            <label>处理：</label>
+            <label class="radio"><input type="radio" value="charge" v-model="review.decision">补收</label>
+            <label class="radio"><input type="radio" value="refund" v-model="review.decision">退款</label>
+            <label class="radio"><input type="radio" value="none" v-model="review.decision">无差额</label>
+          </div>
+        </div>
+        <div class="form-row">
+          <label>主管备注</label>
+          <input v-model="review.supervisor_note" placeholder="已核对原标签与实物一致…">
+        </div>
+        <div class="modal-actions">
+          <button class="btn danger" @click="doReject">驳回申请</button>
+          <button class="btn ghost" @click="reviewing=null">取消</button>
+          <button class="btn primary" :disabled="!preview" @click="doApprove">核准并收/退差额</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 收银员发起纠错弹窗 -->
+    <div class="modal-mask" v-if="correcting" @click.self="correcting=null">
+      <div class="modal">
+        <h2>发起结账后纠错申请</h2>
+        <p class="muted">订单 {{correcting.txn_no}}｜标签 {{correcting.label_barcode}}｜
+          {{correcting.product_name}} {{correcting.net_weight}}kg，原收 {{correcting.amount.toFixed(2)}} 元</p>
+        <div class="form-row">
+          <label>错贴情况说明</label>
+          <textarea v-model="correctionReason" rows="3" placeholder="例如：顾客反馈实物为果冻，标签错贴成花生糖"></textarea>
+        </div>
+        <div class="modal-actions">
+          <button class="btn ghost" @click="correcting=null">取消</button>
+          <button class="btn primary" @click="doCreateCorrection">提交申请（主管审批）</button>
+        </div>
+      </div>
+    </div>
+  </section>
+</div>
+<script src="/vendor/vue.global.prod.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -3,6 +3,7 @@
 !.env.example
 node_modules/
 .venv/
+data/*.db
 __pycache__/
 target/
 dist/
